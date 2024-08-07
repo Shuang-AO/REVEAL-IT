@@ -7,23 +7,23 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from tianshou.data import (
+from data import (
     Batch,
     ReplayBuffer,
     SequenceSummaryStats,
     to_torch,
     to_torch_as,
 )
-from tianshou.data.batch import BatchProtocol
-from tianshou.data.types import (
+from data.batch import BatchProtocol
+from data.types import (
     BatchWithReturnsProtocol,
     DistBatchProtocol,
     ObsBatchProtocol,
     RolloutBatchProtocol,
 )
-from tianshou.policy import BasePolicy
-from tianshou.policy.base import TLearningRateScheduler, TrainingStats
-from tianshou.utils import RunningMeanStd
+from policy_set import BasePolicy
+from policy_set.base import TLearningRateScheduler, TrainingStats
+from utils import RunningMeanStd
 
 # TODO: Is there a better way to define this type? mypy doesn't like Callable[[torch.Tensor, ...], torch.distributions.Distribution]
 TDistributionFunction: TypeAlias = Callable[..., torch.distributions.Distribution]
