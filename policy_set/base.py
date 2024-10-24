@@ -10,20 +10,24 @@ import numpy as np
 import torch
 from gymnasium.spaces import Box, Discrete, MultiBinary, MultiDiscrete
 from numba import njit
+from numpy.typing import ArrayLike
 from overrides import override
 from torch import nn
 
 from data import ReplayBuffer, SequenceSummaryStats, to_numpy, to_torch_as
-from data.batch import Batch, BatchProtocol, arr_type
+from data.batch import Batch, BatchProtocol, TArr
 from data.buffer.base import TBuffer
 from data.types import (
     ActBatchProtocol,
+    ActStateBatchProtocol,
     BatchWithReturnsProtocol,
     ObsBatchProtocol,
     RolloutBatchProtocol,
 )
 from utils import MultipleLRSchedulers
+from utils.net.common import RandomActor
 from utils.print import DataclassPPrintMixin
+from utils.torch_utils import policy_within_training_step, torch_train_mode
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,11 @@ class TrainingStats(DataclassPPrintMixin):
         return self.__dict__
 
     def get_loss_stats_dict(self) -> dict[str, float]:
-        """Return loss statistics as a dict for logging."""
+        """Return loss statistics as a dict for logging.
+
+        Returns a dict with all fields except train_time and smoothed_loss. Moreover, fields with value None excluded,
+        and instances of SequenceSummaryStats are replaced by their mean.
+        """
         result = {}
         for k, v in self._get_self_dict().items():
             if k.startswith("_"):
@@ -69,6 +77,11 @@ class TrainingStatsWrapper(TrainingStats):
     def __init__(self, wrapped_stats: TrainingStats) -> None:
         """In this particular case, super().__init__() should be called LAST in the subclass init."""
         self._wrapped_stats = wrapped_stats
+
+        # HACK: special sauce for the existing attributes of the base TrainingStats class
+        # for some reason, delattr doesn't work here, so we need to delegate their handling
+        # to the wrapped stats object by always keeping the value there and in self in sync
+        # see also __setattr__
         for k in self._training_stats_public_fields:
             super().__setattr__(k, getattr(self._wrapped_stats, k))
 
@@ -87,6 +100,11 @@ class TrainingStatsWrapper(TrainingStats):
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Setattr logic for wrapper of a dataclass with default values.
+
+        1. If name exists directly in self, set it there.
+        2. If it exists in self._wrapped_stats, set it there instead.
+        3. Special case: if name is in the base TrainingStats class, keep it in sync between self and the _wrapped_stats.
+        4. If name doesn't exist in either and attribute setting is frozen, raise an AttributeError.
         """
         # HACK: special sauce for the existing attributes of the base TrainingStats class, see init
         # Need to keep them in sync with the wrapped stats object
@@ -116,8 +134,6 @@ TTrainingStats = TypeVar("TTrainingStats", bound=TrainingStats)
 
 
 class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
-    """The base class for any RL policy.
-    """
 
     def __init__(
         self,
@@ -148,17 +164,29 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         self.observation_space = observation_space
         self.action_space = action_space
         if isinstance(action_space, Discrete | MultiDiscrete | MultiBinary):
-            self.action_type = "discrete"
+            action_type = "discrete"
         elif isinstance(action_space, Box):
-            self.action_type = "continuous"
+            action_type = "continuous"
         else:
             raise ValueError(f"Unsupported action space: {action_space}.")
+        self._action_type = cast(Literal["discrete", "continuous"], action_type)
         self.agent_id = 0
         self.updating = False
         self.action_scaling = action_scaling
         self.action_bound_method = action_bound_method
         self.lr_scheduler = lr_scheduler
+        self.is_within_training_step = False
         self._compile()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # TODO Use setstate function once merged
+        if "is_within_training_step" not in state:
+            state["is_within_training_step"] = False
+        self.__dict__ = state
+
+    @property
+    def action_type(self) -> Literal["discrete", "continuous"]:
+        return self._action_type
 
     def set_agent_id(self, agent_id: int) -> None:
         """Set self.agent_id = agent_id, for MARL."""
@@ -168,11 +196,14 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
     #  have a method to add noise to action.
     #  So we add the default behavior here. It's a little messy, maybe one can
     #  find a better way to do this.
+
+    _TArrOrActBatch = TypeVar("_TArrOrActBatch", bound="np.ndarray | ActBatchProtocol")
+
     def exploration_noise(
         self,
-        act: np.ndarray | BatchProtocol,
-        batch: RolloutBatchProtocol,
-    ) -> np.ndarray | BatchProtocol:
+        act: _TArrOrActBatch,
+        batch: ObsBatchProtocol,
+    ) -> _TArrOrActBatch:
         return act
 
     def soft_update(self, tgt: nn.Module, src: nn.Module, tau: float) -> None:
@@ -182,12 +213,12 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def compute_action(
         self,
-        obs: arr_type,
+        obs: ArrayLike,
         info: dict[str, Any] | None = None,
         state: dict | BatchProtocol | np.ndarray | None = None,
     ) -> np.ndarray | int:
-        # need to add empty batch dimension
-        obs = obs[None, :]
+        obs = np.array(obs)  # convert array-like to array (e.g. LazyFrames)
+        obs = obs[None, :]  # add batch dimension
         obs_batch = cast(ObsBatchProtocol, Batch(obs=obs, info=info))
         act = self.forward(obs_batch, state=state).act.squeeze()
         if isinstance(act, torch.Tensor):
@@ -204,12 +235,12 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         batch: ObsBatchProtocol,
         state: dict | BatchProtocol | np.ndarray | None = None,
         **kwargs: Any,
-    ) -> ActBatchProtocol:
+    ) -> ActBatchProtocol | ActStateBatchProtocol:  # TODO: make consistent typing
         """Compute action over the given batch data.
         """
 
     @staticmethod
-    def _action_to_numpy(act: arr_type) -> np.ndarray:
+    def _action_to_numpy(act: TArr) -> np.ndarray:
         act = to_numpy(act)  # NOTE: to_numpy could confusingly also return a Batch
         if not isinstance(act, np.ndarray):
             raise ValueError(
@@ -219,7 +250,7 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def map_action(
         self,
-        act: arr_type,
+        act: TArr,
     ) -> np.ndarray:
         """Map raw network output to action range in gym's env.action_space.
         """
@@ -239,9 +270,18 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def map_action_inverse(
         self,
-        act: arr_type,
+        act: TArr,
     ) -> np.ndarray:
         """Inverse operation to :meth:`~tianshou.policy.BasePolicy.map_action`.
+
+        This function is called in :meth:`~tianshou.data.Collector.collect` for
+        random initial steps. It scales [action_space.low, action_space.high] to
+        the value ranges of policy.forward.
+
+        :param act: a data batch, list or numpy.ndarray which is the action taken
+            by gym.spaces.Box.sample().
+
+        :return: action remapped.
         """
         act = self._action_to_numpy(act)
         if isinstance(self.action_space, gym.spaces.Box):
@@ -258,6 +298,13 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def process_buffer(self, buffer: TBuffer) -> TBuffer:
         """Pre-process the replay buffer, e.g., to add new keys.
+
+        Used in BaseTrainer initialization method, usually used by offline trainers.
+
+        Note: this will only be called once, when the trainer is initialized!
+            If the buffer is empty by then, there will be nothing to process.
+            This method is meant to be overridden by policies which will be trained
+            offline at some stage, e.g., in a pre-training step.
         """
         return buffer
 
@@ -267,15 +314,18 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         buffer: ReplayBuffer,
         indices: np.ndarray,
     ) -> RolloutBatchProtocol:
-        """Pre-process the data from the provided replay buffer.
-        """
         return batch
 
     @abstractmethod
     def learn(self, batch: RolloutBatchProtocol, *args: Any, **kwargs: Any) -> TTrainingStats:
         """Update policy with a given batch of data.
-        """
 
+        :return: A dataclass object, including the data needed to be logged (e.g., loss).
+            In order to distinguish the collecting state, updating state and
+            testing state, you can check the policy state by ``self.training``
+            and ``self.updating``. Please refer to :ref:`policy_state` for more
+            detailed explanation.
+        """
     def post_process_fn(
         self,
         batch: BatchProtocol,
@@ -283,6 +333,12 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         indices: np.ndarray,
     ) -> None:
         """Post-process the data from the provided replay buffer.
+
+        This will only have an effect if the buffer has the
+        method `update_weight` and the batch has the attribute `weight`.
+
+        Typical usage is to update the sampling weight in prioritized
+        experience replay. Used in :meth:`update`.
         """
         if hasattr(buffer, "update_weight"):
             if hasattr(batch, "weight"):
@@ -301,16 +357,41 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         **kwargs: Any,
     ) -> TTrainingStats:
         """Update the policy network and replay buffer.
+
+        It includes 3 function steps: process_fn, learn, and post_process_fn. In
+        addition, this function will change the value of ``self.updating``: it will be
+        False before this function and will be True when executing :meth:`update`.
+        Please refer to :ref:`policy_state` for more detailed explanation. The return
+        value of learn is augmented with the training time within update, while smoothed
+        loss values are computed in the trainer.
+
+        :param sample_size: 0 means it will extract all the data from the buffer,
+            otherwise it will sample a batch with given sample_size. None also
+            means it will extract all the data from the buffer, but it will be shuffled
+            first. TODO: remove the option for 0?
+        :param buffer: the corresponding replay buffer.
+
+        :return: A dataclass object containing the data needed to be logged (e.g., loss) from
+            ``policy.learn()``.
         """
         # TODO: when does this happen?
         # -> this happens never in practice as update is either called with a collector buffer or an assert before
+
+        if not self.is_within_training_step:
+            raise RuntimeError(
+                f"update() was called outside of a training step as signalled by {self.is_within_training_step=} "
+                f"If you want to update the policy without a Trainer, you will have to manage the above-mentioned "
+                f"flag yourself. You can to this e.g., by using the contextmanager {policy_within_training_step.__name__}.",
+            )
+
         if buffer is None:
             return TrainingStats()  # type: ignore[return-value]
         start_time = time.time()
         batch, indices = buffer.sample(sample_size)
         self.updating = True
         batch = self.process_fn(batch, buffer, indices)
-        training_stat = self.learn(batch, **kwargs)
+        with torch_train_mode(self):
+            training_stat = self.learn(batch, **kwargs)
         self.post_process_fn(batch, buffer, indices)
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -321,6 +402,20 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
     @staticmethod
     def value_mask(buffer: ReplayBuffer, indices: np.ndarray) -> np.ndarray:
         """Value mask determines whether the obs_next of buffer[indices] is valid.
+
+        For instance, usually "obs_next" after "done" flag is considered to be invalid,
+        and its q/advantage value can provide meaningless (even misleading)
+        information, and should be set to 0 by hand. But if "done" flag is generated
+        because timelimit of game length (info["TimeLimit.truncated"] is set to True in
+        gym's settings), "obs_next" will instead be valid. Value mask is typically used
+        for assisting in calculating the correct q/advantage value.
+
+        :param buffer: the corresponding replay buffer.
+        :param numpy.ndarray indices: indices of replay buffer whose "obs_next" will be
+            judged.
+
+        :return: A bool type numpy.ndarray in the same shape with indices. "True" means
+            "obs_next" of that buffer[indices] is valid.
         """
         return ~buffer.terminated[indices]
 
@@ -335,8 +430,12 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         gae_lambda: float = 0.95,
     ) -> tuple[np.ndarray, np.ndarray]:
         r"""Compute returns over given batch.
-        """
 
+        Setting `v_s_` and `v_s` to None (or all zeros) and `gae_lambda` to 1.0 calculates the
+        discounted return-to-go/ Monte-Carlo return.
+
+        :return: two numpy arrays (returns, advantage) with each shape (bsz, ).
+        """
         rew = batch.rew
         if v_s_ is None:
             assert np.isclose(gae_lambda, 1.0)
@@ -364,32 +463,64 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         rew_norm: bool = False,
     ) -> BatchWithReturnsProtocol:
         r"""Compute n-step return for Q-learning targets.
-        """
 
+        .. math::
+            G_t = \sum_{i = t}^{t + n - 1} \gamma^{i - t}(1 - d_i)r_i +
+            \gamma^n (1 - d_{t + n}) Q_{\mathrm{target}}(s_{t + n})
+
+        where :math:`\gamma` is the discount factor, :math:`\gamma \in [0, 1]`,
+        :math:`d_t` is the done flag of step :math:`t`.
+        """
         assert not rew_norm, "Reward normalization in computing n-step returns is unsupported now."
         if len(indices) != len(batch):
             raise ValueError(f"Batch size {len(batch)} and indices size {len(indices)} mismatch.")
 
-        rew = buffer.rew
-        bsz = len(indices)
-        indices = [indices]
-        for _ in range(n_step - 1):
-            indices.append(buffer.next(indices[-1]))
-        indices = np.stack(indices)
-        # terminal indicates buffer indexes nstep after 'indices',
-        # and are truncated at the end of each episode
-        terminal = indices[-1]
-        with torch.no_grad():
-            target_q_torch = target_q_fn(buffer, terminal)  # (bsz, ?)
-        target_q = to_numpy(target_q_torch.reshape(bsz, -1))
-        target_q = target_q * BasePolicy.value_mask(buffer, terminal).reshape(-1, 1)
-        end_flag = buffer.done.copy()
-        end_flag[buffer.unfinished_index()] = True
-        target_q = _nstep_return(rew, end_flag, target_q, indices, gamma, n_step)
+        # naming convention
+        #  I = number of indices
+        #  B = size of the replay buffer
+        #  N = n_step
+        #  A = the output dimension of target_q_fn for a single index. Presumably
+        #      this is the number of actions in the discrete case, or something like that.
+        #  1 = 1 extra dimension
+        #  TODO: it's very weird that this is not always one!
+        #   We set the n-step-return for a single index to be the same shape as the target_q_fn.
+        #   I don't understand how a non-scalar value would make sense there, but such cases are covered by tests
 
-        batch.returns = to_torch_as(target_q, target_q_torch)
-        if hasattr(batch, "weight"):  # prio buffer update
-            batch.weight = to_torch_as(batch.weight, target_q_torch)
+        # support in following naming convention
+        I = len(indices)
+        N = n_step
+
+        _indices_to_stack = [indices]
+        for _ in range(N - 1):
+            next_indices = buffer.next(_indices_to_stack[-1])
+            _indices_to_stack.append(next_indices)
+        stacked_indices_NI = np.stack(_indices_to_stack)
+        indices_after_n_steps_I = stacked_indices_NI[-1]
+
+        with torch.no_grad():
+            target_q_torch_IA = target_q_fn(buffer, indices_after_n_steps_I)
+        target_q_IA = to_numpy(target_q_torch_IA.reshape(I, -1))
+        """Represents the Q-values (one for each action) of the transition after N steps."""
+
+        target_q_IA *= BasePolicy.value_mask(buffer, indices_after_n_steps_I).reshape(-1, 1)
+        end_flag_B = buffer.done.copy()
+        end_flag_B[buffer.unfinished_index()] = True
+        n_step_return_IA = _nstep_return(
+            buffer.rew,
+            end_flag_B,
+            target_q_IA,
+            stacked_indices_NI,
+            gamma,
+            n_step,
+        )
+        """The n-step return plus the last Q-values, see method's docstring"""
+
+        batch.returns = to_torch_as(n_step_return_IA, target_q_torch_IA)
+
+        # TODO: this is simply casting to a certain type. Why is this necessary, and why is it happening here?
+        if hasattr(batch, "weight"):
+            batch.weight = to_torch_as(batch.weight, target_q_torch_IA)
+
         return cast(BatchWithReturnsProtocol, batch)
 
     @staticmethod
@@ -403,6 +534,31 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         _nstep_return(f64, b, f32.reshape(-1, 1), i64, 0.1, 1)
 
 
+class RandomActionPolicy(BasePolicy):
+    def __init__(
+        self,
+        action_space: gym.Space,
+    ) -> None:
+        super().__init__(action_space=action_space)
+        if not isinstance(action_space, gym.spaces.Discrete | gym.spaces.Box):
+            raise NotImplementedError(
+                f"RandomActionPolicy currently only supports Discrete and Box action spaces, but got {action_space}.",
+            )
+        self.actor = RandomActor(action_space)
+
+    def forward(
+        self,
+        batch: ObsBatchProtocol,
+        state: dict | BatchProtocol | np.ndarray | None = None,
+        **kwargs: Any,
+    ) -> ActStateBatchProtocol:
+        act, next_state = self.actor.compute_action_batch(batch.obs), state
+        return cast(ActStateBatchProtocol, Batch(act=act, state=next_state))
+
+    def learn(self, batch: RolloutBatchProtocol, *args: Any, **kwargs: Any) -> TrainingStats:
+        return TrainingStats()
+
+
 # TODO: rename? See docstring
 @njit
 def _gae_return(
@@ -413,8 +569,7 @@ def _gae_return(
     gamma: float,
     gae_lambda: float,
 ) -> np.ndarray:
-    r"""Computes advantages with GAE.
-
+    r"""
     .. math::
         G_t^\lambda = r_t + \gamma ( \lambda G_{t+1}^\lambda + (1 - \lambda) V_{t+1} )
 
@@ -423,6 +578,11 @@ def _gae_return(
     .. math::
         \delta_t = r_t + \gamma V_{t+1} - V_t \n
         A_t^\lambda= \delta_t + \gamma \lambda A_{t+1}^\lambda
+
+    And the following equality holds:
+
+    .. math::
+        G_t^\lambda = A_t^\lambda+ V_t
     """
     returns = np.zeros(rew.shape)
     delta = rew + v_s_ * gamma - v_s
@@ -435,27 +595,44 @@ def _gae_return(
 
 
 @njit
+def episode_mc_return_to_go(rewards: np.ndarray, gamma: float = 0.99) -> np.ndarray:
+    len_episode = len(rewards)
+    ret2go = np.zeros(len_episode)
+    ret2go[-1] = rewards[-1]
+
+    for j in range(len_episode - 2, -1, -1):
+        ret2go[j] = rewards[j] + gamma * ret2go[j + 1]
+    return ret2go
+
+
+@njit
 def _nstep_return(
-    rew: np.ndarray,
-    end_flag: np.ndarray,
-    target_q: np.ndarray,
-    indices: np.ndarray,
+    rew_B: np.ndarray,
+    end_flag_B: np.ndarray,
+    target_q_IA: np.ndarray,
+    stacked_indices_NI: np.ndarray,
     gamma: float,
     n_step: int,
 ) -> np.ndarray:
-    gamma_buffer = np.ones(n_step + 1)
-    for i in range(1, n_step + 1):
-        gamma_buffer[i] = gamma_buffer[i - 1] * gamma
-    target_shape = target_q.shape
-    bsz = target_shape[0]
-    # change target_q to 2d array
-    target_q = target_q.reshape(bsz, -1)
-    returns = np.zeros(target_q.shape)
-    gammas = np.full(indices[0].shape, n_step)
-    for n in range(n_step - 1, -1, -1):
-        now = indices[n]
-        gammas[end_flag[now] > 0] = n + 1
-        returns[end_flag[now] > 0] = 0.0
-        returns = rew[now].reshape(bsz, 1) + gamma * returns
-    target_q = target_q * gamma_buffer[gammas].reshape(bsz, 1) + returns
-    return target_q.reshape(target_shape)
+    N = n_step
+    I, A = target_q_IA.shape
+    gamma_buffer_N = np.ones(N + 1)
+    for i in range(1, N + 1):
+        gamma_buffer_N[i] = gamma_buffer_N[i - 1] * gamma
+    target_q_IA = target_q_IA.reshape(I, -1)
+    """Make sure tarqet_q_I has an empty extra dimension, usually already passed with the
+    right shape, hence the input param name"""
+    n_step_mc_returns_IA = np.zeros(target_q_IA.shape)
+    """Will hold the n_step MC return part of the final n_step + Q-value return.
+    """
+    gammas_IN = np.full(I, N)
+    for n in range(N - 1, -1, -1):
+        now = stacked_indices_NI[n]
+        gammas_IN[end_flag_B[now] > 0] = n + 1
+        n_step_mc_returns_IA[end_flag_B[now] > 0] = 0.0
+        n_step_mc_returns_IA = rew_B[now].reshape(I, 1) + gamma * n_step_mc_returns_IA
+
+    n_step_return_with_Q_IA = (
+        target_q_IA * gamma_buffer_N[gammas_IN].reshape(I, 1) + n_step_mc_returns_IA
+    )
+    return n_step_return_with_Q_IA.reshape((I, A))

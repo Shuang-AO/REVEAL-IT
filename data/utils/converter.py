@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 import torch
 
-from tianshou.data.batch import Batch, _parse_value
+from data.batch import Batch, _parse_value
 
 
 # TODO: confusing name, could actually return a batch...

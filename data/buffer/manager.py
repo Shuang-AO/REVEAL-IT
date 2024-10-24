@@ -4,9 +4,9 @@ from typing import Union
 import numpy as np
 from numba import njit
 
-from tianshou.data import Batch, HERReplayBuffer, PrioritizedReplayBuffer, ReplayBuffer
-from tianshou.data.batch import alloc_by_keys_diff, create_value
-from tianshou.data.types import RolloutBatchProtocol
+from data import Batch, HERReplayBuffer, PrioritizedReplayBuffer, ReplayBuffer
+from data.batch import alloc_by_keys_diff, create_value
+from data.types import RolloutBatchProtocol
 
 
 class ReplayBufferManager(ReplayBuffer):

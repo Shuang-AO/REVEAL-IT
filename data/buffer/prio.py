@@ -3,8 +3,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 
-from tianshou.data import ReplayBuffer, SegmentTree, to_numpy
-from tianshou.data.types import PrioBatchProtocol, RolloutBatchProtocol
+from data import ReplayBuffer, SegmentTree, to_numpy
+from data.types import PrioBatchProtocol, RolloutBatchProtocol
 
 
 class PrioritizedReplayBuffer(ReplayBuffer):

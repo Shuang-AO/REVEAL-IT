@@ -9,7 +9,7 @@ from torch.distributions import kl_divergence
 
 from data import Batch, SequenceSummaryStats
 from policy_set import NPGPolicy
-from policy.base import TLearningRateScheduler
+from policy_set.base import TLearningRateScheduler
 from policy_set.npg import NPGTrainingStats
 from policy_set.pg import TDistributionFunction
 

@@ -4,7 +4,7 @@ import cloudpickle
 import gymnasium
 import numpy as np
 
-from tianshou.env.pettingzoo_env import PettingZooEnv
+from env.pettingzoo_env import PettingZooEnv
 
 ENV_TYPE = gymnasium.Env | PettingZooEnv
 

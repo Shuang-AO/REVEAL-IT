@@ -1,30 +1,30 @@
 """Data package."""
 # isort:skip_file
 
-from tianshou.data.batch import Batch
-from tianshou.data.utils.converter import to_numpy, to_torch, to_torch_as
-from tianshou.data.utils.segtree import SegmentTree
-from tianshou.data.buffer.base import ReplayBuffer
-from tianshou.data.buffer.prio import PrioritizedReplayBuffer
-from tianshou.data.buffer.her import HERReplayBuffer
-from tianshou.data.buffer.manager import (
+from data.batch import Batch
+from data.utils.converter import to_numpy, to_torch, to_torch_as
+from data.utils.segtree import SegmentTree
+from data.buffer.base import ReplayBuffer
+from data.buffer.prio import PrioritizedReplayBuffer
+from data.buffer.her import HERReplayBuffer
+from data.buffer.manager import (
     ReplayBufferManager,
     PrioritizedReplayBufferManager,
     HERReplayBufferManager,
 )
-from tianshou.data.buffer.vecbuf import (
+from data.buffer.vecbuf import (
     HERVectorReplayBuffer,
     PrioritizedVectorReplayBuffer,
     VectorReplayBuffer,
 )
-from tianshou.data.buffer.cached import CachedReplayBuffer
-from tianshou.data.stats import (
+from data.buffer.cached import CachedReplayBuffer
+from data.stats import (
     EpochStats,
     InfoStats,
     SequenceSummaryStats,
     TimingStats,
 )
-from tianshou.data.collector import Collector, AsyncCollector, CollectStats, CollectStatsBase
+from data.collector import Collector, AsyncCollector, CollectStats, CollectStatsBase
 
 __all__ = [
     "Batch",

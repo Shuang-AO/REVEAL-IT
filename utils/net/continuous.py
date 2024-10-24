@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from tianshou.utils.net.common import (
+from utils.net.common import (
     MLP,
     BaseActor,
     TActionShape,

@@ -11,11 +11,14 @@ from data import ReplayBuffer, SequenceSummaryStats, to_torch_as
 from data.types import BatchWithAdvantagesProtocol, RolloutBatchProtocol
 from policy_set import PGPolicy
 from policy_set.base import TLearningRateScheduler, TrainingStats
-from policy_set.modelfree.pg import TDistributionFunction
-from utils.net.common import ActorCritic
+from policy_set.pg import TDistributionFunction
+#from utils.net.common import ActorCritic
 
-
+def get_actor_critic():
+       from utils.net.common import ActorCritic
+       return ActorCritic
 @dataclass(kw_only=True)
+
 class A2CTrainingStats(TrainingStats):
     loss: SequenceSummaryStats
     actor_loss: SequenceSummaryStats

@@ -2,7 +2,7 @@ from typing import Any
 
 import numpy as np
 
-from tianshou.data import (
+from data import (
     HERReplayBuffer,
     HERReplayBufferManager,
     PrioritizedReplayBuffer,

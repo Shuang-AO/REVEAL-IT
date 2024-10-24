@@ -15,7 +15,7 @@ class MultipleLRSchedulers:
         policy = PPOPolicy(..., lr_scheduler=scheduler)
     """
 
-    def __init__(self, *args: torch.optim.lr_scheduler.LRScheduler):
+    def __init__(self, *args: torch.optim.lr_scheduler._LRScheduler):
         self.schedulers = args
 
     def step(self) -> None:

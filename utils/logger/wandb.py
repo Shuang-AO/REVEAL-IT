@@ -5,8 +5,8 @@ from collections.abc import Callable
 
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.utils import BaseLogger, TensorboardLogger
-from tianshou.utils.logger.base import VALID_LOG_VALS_TYPE
+from utils import BaseLogger, TensorboardLogger
+from utils.logger.base import VALID_LOG_VALS_TYPE
 
 with contextlib.suppress(ImportError):
     import wandb

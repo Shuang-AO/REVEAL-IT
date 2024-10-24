@@ -1,14 +1,17 @@
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
-from tianshou.utils.print import DataclassPPrintMixin
+from utils.print import DataclassPPrintMixin
 
 if TYPE_CHECKING:
-    from tianshou.data import CollectStats, CollectStatsBase
-    from tianshou.policy.base import TrainingStats
+    from data import CollectStats, CollectStatsBase
+    from policy_set.base import TrainingStats
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -22,12 +25,36 @@ class SequenceSummaryStats(DataclassPPrintMixin):
 
     @classmethod
     def from_sequence(cls, sequence: Sequence[float | int] | np.ndarray) -> "SequenceSummaryStats":
+        if len(sequence) == 0:
+            return cls(mean=0.0, std=0.0, max=0.0, min=0.0)
+
+        if hasattr(sequence, "shape") and len(sequence.shape) > 1:
+            log.warning(
+                f"Sequence has shape {sequence.shape}, but only 1D sequences are supported. "
+                "Stats will be computed from the flattened sequence. For computing stats "
+                "for each dimension consider using the function `compute_dim_to_summary_stats`.",
+            )
+
         return cls(
             mean=float(np.mean(sequence)),
             std=float(np.std(sequence)),
             max=float(np.max(sequence)),
             min=float(np.min(sequence)),
         )
+
+
+def compute_dim_to_summary_stats(
+    arr: Sequence[Sequence[float]] | np.ndarray,
+) -> dict[int, SequenceSummaryStats]:
+    """Compute summary statistics for each dimension of a sequence.
+
+    :param arr: a 2-dim arr (or sequence of sequences) from which to compute the statistics.
+    :return: A dictionary of summary statistics for each dimension.
+    """
+    stats = {}
+    for dim, seq in enumerate(arr):
+        stats[dim] = SequenceSummaryStats.from_sequence(seq)
+    return stats
 
 
 @dataclass(kw_only=True)
@@ -54,6 +81,8 @@ class InfoStats(DataclassPPrintMixin):
 
     gradient_step: int
     """The total gradient step."""
+    best_score: float
+    """The best score over the test results. The one with the highest score will be considered the best model."""
     best_reward: float
     """The best reward over the test results."""
     best_reward_std: float
@@ -82,7 +111,8 @@ class EpochStats(DataclassPPrintMixin):
     """The statistics of the last call to the training collector."""
     test_collect_stat: Optional["CollectStats"]
     """The statistics of the last call to the test collector."""
-    training_stat: "TrainingStats"
-    """The statistics of the last model update step."""
+    training_stat: Optional["TrainingStats"]
+    """The statistics of the last model update step.
+    Can be None if no model update is performed, typically in the last training iteration."""
     info_stat: InfoStats
     """The information of the collector."""

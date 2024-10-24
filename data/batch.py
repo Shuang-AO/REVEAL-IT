@@ -1,10 +1,12 @@
 import pprint
 import warnings
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, KeysView, Sequence
 from copy import deepcopy
 from numbers import Number
+from types import EllipsisType
 from typing import (
     Any,
+    Literal,
     Protocol,
     Self,
     TypeVar,
@@ -15,11 +17,20 @@ from typing import (
 )
 
 import numpy as np
+import pandas as pd
 import torch
+from deepdiff import DeepDiff
+from sensai.util import logging
+from torch.distributions import Categorical, Distribution, Independent, Normal
 
-IndexType = slice | int | np.ndarray | list[int]
+_SingleIndexType = slice | int | EllipsisType
+IndexType = np.ndarray | _SingleIndexType | Sequence[_SingleIndexType]
 TBatch = TypeVar("TBatch", bound="BatchProtocol")
-arr_type = torch.Tensor | np.ndarray
+TDistribution = TypeVar("TDistribution", bound=Distribution)
+T = TypeVar("T")
+TArr = torch.Tensor | np.ndarray
+
+log = logging.getLogger(__name__)
 
 
 def _is_batch_set(obj: Any) -> bool:
@@ -183,14 +194,68 @@ def alloc_by_keys_diff(
 
     This mainly is an internal method, use it only if you know what you are doing.
     """
-    for key in batch.keys():
-        if key in meta.keys():
+    for key in batch.get_keys():
+        if key in meta.get_keys():
             if isinstance(meta[key], Batch) and isinstance(batch[key], Batch):
                 alloc_by_keys_diff(meta[key], batch[key], size, stack)
-            elif isinstance(meta[key], Batch) and meta[key].is_empty():
+            elif isinstance(meta[key], Batch) and len(meta[key].get_keys()) == 0:
                 meta[key] = create_value(batch[key], size, stack)
         else:
             meta[key] = create_value(batch[key], size, stack)
+
+
+class ProtocolCalledException(Exception):
+    """The methods of a Protocol should never be called.
+
+    Currently, no static type checker actually verifies that a class that inherits
+    from a Protocol does in fact provide the correct interface. Thus, it may happen
+    that a method of the protocol is called accidentally (this is an
+    implementation error). The normal error for that is a somewhat cryptic
+    AttributeError, wherefore we instead raise this custom exception in the
+    BatchProtocol.
+
+    Finally and importantly: using this in BatchProtocol makes mypy verify the fields
+    in the various sub-protocols and thus renders is MUCH more useful!
+    """
+
+
+def get_sliced_dist(dist: TDistribution, index: IndexType) -> TDistribution:
+    """Slice a distribution object by the given index."""
+    if isinstance(dist, Categorical):
+        return Categorical(probs=dist.probs[index])  # type: ignore[return-value]
+    if isinstance(dist, Normal):
+        return Normal(loc=dist.loc[index], scale=dist.scale[index])  # type: ignore[return-value]
+    if isinstance(dist, Independent):
+        return Independent(
+            get_sliced_dist(dist.base_dist, index),
+            dist.reinterpreted_batch_ndims,
+        )  # type: ignore[return-value]
+    else:
+        raise NotImplementedError(f"Unsupported distribution for slicing: {dist}")
+
+
+def get_len_of_dist(dist: Distribution) -> int:
+    """Return the length (typically batch size) of a distribution object."""
+    if len(dist.batch_shape) == 0:
+        raise TypeError(f"scalar Distribution has no length: {dist=}")
+    return dist.batch_shape[0]
+
+
+def dist_to_atleast_2d(dist: TDistribution) -> TDistribution:
+    """Convert a distribution to at least 2D, such that the `batch_shape` attribute has a len of at least 1."""
+    if len(dist.batch_shape) > 0:
+        return dist
+    if isinstance(dist, Categorical):
+        return Categorical(probs=dist.probs.unsqueeze(0))  # type: ignore[return-value]
+    elif isinstance(dist, Normal):
+        return Normal(loc=dist.loc.unsqueeze(0), scale=dist.scale.unsqueeze(0))  # type: ignore[return-value]
+    elif isinstance(dist, Independent):
+        return Independent(
+            dist_to_atleast_2d(dist.base_dist),
+            dist.reinterpreted_batch_ndims,
+        )  # type: ignore[return-value]
+    else:
+        raise NotImplementedError(f"Unsupported distribution for conversion to 2D: {type(dist)}")
 
 
 # Note: This is implemented as a protocol because the interface
@@ -211,73 +276,94 @@ class BatchProtocol(Protocol):
 
     @property
     def shape(self) -> list[int]:
-        ...
+        raise ProtocolCalledException
 
+    # NOTE: even though setattr and getattr are defined for any object, we need
+    # to explicitly define them for the BatchProtocol, since otherwise mypy will
+    # complain about new fields being added dynamically. For example, things like
+    # `batch.new_field = ...` followed by using `batch.new_field` become type errors
+    # if getattr and setattr are missing in the BatchProtocol.
+    #
+    # For the moment, tianshou relies on this kind of dynamic-field-addition
+    # in many, many places. In principle, it would be better to construct new
+    # objects with new combinations of fields instead of mutating existing ones - the
+    # latter is error-prone and can't properly be expressed with types. May be in a
+    # future, rather different version of tianshou it would be feasible to have stricter
+    # typing. Then the need for Protocols would in fact disappear
     def __setattr__(self, key: str, value: Any) -> None:
-        ...
+        raise ProtocolCalledException
 
     def __getattr__(self, key: str) -> Any:
-        ...
+        raise ProtocolCalledException
 
-    def __contains__(self, key: str) -> bool:
-        ...
-
-    def __getstate__(self) -> dict:
-        ...
-
-    def __setstate__(self, state: dict) -> None:
-        ...
+    def __iter__(self) -> Iterator[Self]:
+        raise ProtocolCalledException
 
     @overload
     def __getitem__(self, index: str) -> Any:
-        ...
+        raise ProtocolCalledException
 
     @overload
     def __getitem__(self, index: IndexType) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __getitem__(self, index: str | IndexType) -> Any:
-        ...
+        raise ProtocolCalledException
 
     def __setitem__(self, index: str | IndexType, value: Any) -> None:
-        ...
+        raise ProtocolCalledException
 
     def __iadd__(self, other: Self | Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __add__(self, other: Self | Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __imul__(self, value: Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __mul__(self, value: Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __itruediv__(self, value: Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __truediv__(self, value: Number | np.number) -> Self:
-        ...
+        raise ProtocolCalledException
 
     def __repr__(self) -> str:
-        ...
+        raise ProtocolCalledException
 
-    def to_numpy(self) -> None:
+    def __eq__(self, other: Any) -> bool:
+        raise ProtocolCalledException
+
+    def to_numpy(self: Self) -> Self:
+        """Change all torch.Tensor to numpy.ndarray and return a new Batch."""
+        raise ProtocolCalledException
+
+    def to_numpy_(self) -> None:
         """Change all torch.Tensor to numpy.ndarray in-place."""
-        ...
+        raise ProtocolCalledException
 
     def to_torch(
+        self: Self,
+        dtype: torch.dtype | None = None,
+        device: str | int | torch.device = "cpu",
+    ) -> Self:
+        """Change all numpy.ndarray to torch.Tensor and return a new Batch."""
+        raise ProtocolCalledException
+
+    def to_torch_(
         self,
         dtype: torch.dtype | None = None,
         device: str | int | torch.device = "cpu",
     ) -> None:
         """Change all numpy.ndarray to torch.Tensor in-place."""
-        ...
+        raise ProtocolCalledException
 
     def cat_(self, batches: Self | Sequence[dict | Self]) -> None:
         """Concatenate a list of (or one) Batch objects into current batch."""
-        ...
+        raise ProtocolCalledException
 
     @staticmethod
     def cat(batches: Sequence[dict | TBatch]) -> TBatch:
@@ -297,11 +383,11 @@ class BatchProtocol(Protocol):
             >>> c.common.c.shape
             (7, 5)
         """
-        ...
+        raise ProtocolCalledException
 
     def stack_(self, batches: Sequence[dict | Self], axis: int = 0) -> None:
         """Stack a list of Batch object into current batch."""
-        ...
+        raise ProtocolCalledException
 
     @staticmethod
     def stack(batches: Sequence[dict | TBatch], axis: int = 0) -> TBatch:
@@ -326,7 +412,7 @@ class BatchProtocol(Protocol):
             If there are keys that are not shared across all batches, ``stack``
             with ``axis != 0`` is undefined, and will cause an exception.
         """
-        ...
+        raise ProtocolCalledException
 
     def empty_(self, index: slice | IndexType | None = None) -> Self:
         """Return an empty Batch object with 0 or None filled.
@@ -353,7 +439,7 @@ class BatchProtocol(Protocol):
                    ),
             )
         """
-        ...
+        raise ProtocolCalledException
 
     @staticmethod
     def empty(batch: TBatch, index: IndexType | None = None) -> TBatch:
@@ -361,17 +447,14 @@ class BatchProtocol(Protocol):
 
         The shape is the same as the given Batch.
         """
-        ...
+        raise ProtocolCalledException
 
     def update(self, batch: dict | Self | None = None, **kwargs: Any) -> None:
         """Update this batch from another dict/Batch."""
-        ...
+        raise ProtocolCalledException
 
     def __len__(self) -> int:
-        ...
-
-    def is_empty(self, recurse: bool = False) -> bool:
-        ...
+        raise ProtocolCalledException
 
     def split(
         self,
@@ -389,7 +472,116 @@ class BatchProtocol(Protocol):
         :param merge_last: merge the last batch into the previous one.
             Default to False.
         """
+        raise ProtocolCalledException
+
+    def to_dict(self, recurse: bool = True) -> dict[str, Any]:
+        raise ProtocolCalledException
+
+    def to_list_of_dicts(self) -> list[dict[str, Any]]:
+        raise ProtocolCalledException
+
+    def get_keys(self) -> KeysView:
+        raise ProtocolCalledException
+
+    def set_array_at_key(
+        self,
+        seq: np.ndarray,
+        key: str,
+        index: IndexType | None = None,
+        default_value: float | None = None,
+    ) -> None:
+        """Set a sequence of values at a given key.
+
+        If `index` is not passed, the sequence must have the same length as the batch.
+
+        :param seq: the array of values to set.
+        :param key: the key to set the sequence at.
+        :param index: the indices to set the sequence at. If None, the sequence must have
+            the same length as the batch and will be set at all indices.
+        :param default_value: this only applies if `index` is passed and the key does not exist yet
+            in the batch. In that case, entries outside the passed index will be filled
+            with this default value.
+            Note that the array at the key will be of the same dtype as the passed sequence,
+            so `default_value` should be such that numpy can cast it to this dtype.
+        """
+        raise ProtocolCalledException
+
+    def isnull(self) -> Self:
+        """Return a boolean mask of the same shape, indicating missing values."""
+        raise ProtocolCalledException
+
+    def hasnull(self) -> bool:
+        """Return whether the batch has missing values."""
+        raise ProtocolCalledException
+
+    def dropnull(self) -> Self:
+        """Return a batch where all items in which any value is null are dropped.
+
+        Note that it is not the same as just dropping the entries of the sequence.
+        For example, with
+
+        >>> b = Batch(a=[None, 2, 3, 4], b=[4, 5, None, 7])
+        >>> b.dropnull()
+
+        will result in
+
+        >>> Batch(a=[2, 4], b=[5, 7])
+
+        This logic is applied recursively to all nested batches. The result is
+        the same as if the batch was flattened, entries were dropped,
+        and then the batch was reshaped back to the original nested structure.
+        """
         ...
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable[[np.ndarray | torch.Tensor], Any],
+    ) -> Self:
+        ...
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable,
+        inplace: Literal[True],
+    ) -> None:
+        ...
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable[[np.ndarray | torch.Tensor], Any],
+        inplace: Literal[False],
+    ) -> Self:
+        ...
+
+    def apply_values_transform(
+        self,
+        values_transform: Callable[[np.ndarray | torch.Tensor], Any],
+        inplace: bool = False,
+    ) -> None | Self:
+        """Apply a function to all arrays in the batch, including nested ones.
+
+        :param values_transform: the function to apply to the arrays.
+        :param inplace: whether to apply the function in-place. If False, a new batch is returned,
+            otherwise the batch is modified in-place and None is returned.
+        """
+        raise ProtocolCalledException
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        raise ProtocolCalledException
+
+    def pop(self, key: str, default: Any | None = None) -> Any:
+        raise ProtocolCalledException
+
+    def to_at_least_2d(self) -> Self:
+        """Ensures that all arrays and dists in the batch have at least 2 dimensions.
+
+        This is useful for ensuring that all arrays in the batch can be concatenated
+        along a new axis.
+        """
+        raise ProtocolCalledException
 
 
 class Batch(BatchProtocol):
@@ -421,6 +613,26 @@ class Batch(BatchProtocol):
             # TODO: that's a rather weird pattern, is it really needed?
             # Feels like kwargs could be just merged into batch_dict in the beginning
             self.__init__(kwargs, copy=copy)  # type: ignore
+
+    def to_dict(self, recursive: bool = True) -> dict[str, Any]:
+        result = {}
+        for k, v in self.__dict__.items():
+            if recursive and isinstance(v, Batch):
+                v = v.to_dict(recursive=recursive)
+            result[k] = v
+        return result
+
+    def get_keys(self) -> KeysView:
+        return self.__dict__.keys()
+
+    def get(self, key: str, default: Any | None = None) -> Any:
+        return self.__dict__.get(key, default)
+
+    def pop(self, key: str, default: Any | None = None) -> Any:
+        return self.__dict__.pop(key, default)
+
+    def to_list_of_dicts(self) -> list[dict[str, Any]]:
+        return [entry.to_dict() for entry in self]
 
     def __setattr__(self, key: str, value: Any) -> None:
         """Set self.key = value."""
@@ -464,19 +676,59 @@ class Batch(BatchProtocol):
         ...
 
     def __getitem__(self, index: str | IndexType) -> Any:
-        """Return self[index]."""
+        """Returns either the value of a key or a sliced Batch object."""
         if isinstance(index, str):
             return self.__dict__[index]
         batch_items = self.items()
         if len(batch_items) > 0:
             new_batch = Batch()
+
+            sliced_obj: Any
             for batch_key, obj in batch_items:
-                if isinstance(obj, Batch) and obj.is_empty():
-                    new_batch.__dict__[batch_key] = Batch()
+                # None and empty Batches as values are added to any slice
+                if obj is None:
+                    sliced_obj = None
+                elif isinstance(obj, Batch) and len(obj.get_keys()) == 0:
+                    sliced_obj = Batch()
+                # We attempt slicing of a distribution. This is hacky, but presents an important special case
+                elif isinstance(obj, Distribution):
+                    sliced_obj = get_sliced_dist(obj, index)
+                # All other objects are either array-like or Batch-like, so hopefully sliceable
+                # A batch should have no scalars
                 else:
-                    new_batch.__dict__[batch_key] = obj[index]
+                    sliced_obj = obj[index]
+                new_batch.__dict__[batch_key] = sliced_obj
             return new_batch
         raise IndexError("Cannot access item from empty Batch object.")
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, self.__class__):
+            return False
+
+        this_batch_no_torch_tensor = self.to_numpy()
+        other_batch_no_torch_tensor = other.to_numpy()
+        # DeepDiff 7.0.1 cannot compare 0-dimensional arrays
+        # so, we ensure with this transform that all array values have at least 1 dim
+        this_batch_no_torch_tensor.apply_values_transform(
+            values_transform=np.atleast_1d,
+            inplace=True,
+        )
+        other_batch_no_torch_tensor.apply_values_transform(
+            values_transform=np.atleast_1d,
+            inplace=True,
+        )
+        this_dict = this_batch_no_torch_tensor.to_dict(recursive=True)
+        other_dict = other_batch_no_torch_tensor.to_dict(recursive=True)
+
+        return not DeepDiff(this_dict, other_dict)
+
+    def __iter__(self) -> Iterator[Self]:
+        # TODO: empty batch raises an error on len and needs separate treatment, that's probably not a good idea
+        if len(self.__dict__) == 0:
+            yield from []
+        else:
+            for i in range(len(self)):
+                yield self[i]
 
     def __setitem__(self, index: str | IndexType, value: Any) -> None:
         """Assign value to self[index]."""
@@ -512,13 +764,13 @@ class Batch(BatchProtocol):
                 other.__dict__.values(),
                 strict=True,
             ):  # TODO are keys consistent?
-                if isinstance(obj, Batch) and obj.is_empty():
+                if isinstance(obj, Batch) and len(obj.get_keys()) == 0:
                     continue
                 self.__dict__[batch_key] += value
             return self
         if _is_number(other):
             for batch_key, obj in self.items():
-                if isinstance(obj, Batch) and obj.is_empty():
+                if isinstance(obj, Batch) and len(obj.get_keys()) == 0:
                     continue
                 self.__dict__[batch_key] += other
             return self
@@ -532,7 +784,7 @@ class Batch(BatchProtocol):
         """Algebraic multiplication with a scalar value in-place."""
         assert _is_number(value), "Only multiplication by a number is supported."
         for batch_key, obj in self.__dict__.items():
-            if isinstance(obj, Batch) and obj.is_empty():
+            if isinstance(obj, Batch) and len(obj.get_keys()) == 0:
                 continue
             self.__dict__[batch_key] *= value
         return self
@@ -545,7 +797,7 @@ class Batch(BatchProtocol):
         """Algebraic division with a scalar value in-place."""
         assert _is_number(value), "Only division by a number is supported."
         for batch_key, obj in self.__dict__.items():
-            if isinstance(obj, Batch) and obj.is_empty():
+            if isinstance(obj, Batch) and len(obj.get_keys()) == 0:
                 continue
             self.__dict__[batch_key] /= value
         return self
@@ -569,14 +821,29 @@ class Batch(BatchProtocol):
             self_str = self.__class__.__name__ + "()"
         return self_str
 
-    def to_numpy(self) -> None:
-        for batch_key, obj in self.items():
-            if isinstance(obj, torch.Tensor):
-                self.__dict__[batch_key] = obj.detach().cpu().numpy()
-            elif isinstance(obj, Batch):
-                obj.to_numpy()
+    def to_numpy(self: Self) -> Self:
+        result = deepcopy(self)
+        result.to_numpy_()
+        return result
+
+    def to_numpy_(self) -> None:
+        def arr_to_numpy(arr: TArr) -> TArr:
+            if isinstance(arr, torch.Tensor):
+                return arr.detach().cpu().numpy()
+            return arr
+
+        self.apply_values_transform(arr_to_numpy, inplace=True)
 
     def to_torch(
+        self: Self,
+        dtype: torch.dtype | None = None,
+        device: str | int | torch.device = "cpu",
+    ) -> Self:
+        result = deepcopy(self)
+        result.to_torch_(dtype=dtype, device=device)
+        return result
+
+    def to_torch_(
         self,
         dtype: torch.dtype | None = None,
         device: str | int | torch.device = "cpu",
@@ -584,28 +851,23 @@ class Batch(BatchProtocol):
         if not isinstance(device, torch.device):
             device = torch.device(device)
 
-        for batch_key, obj in self.items():
-            if isinstance(obj, torch.Tensor):
-                if (
-                    dtype is not None
-                    and obj.dtype != dtype
-                    or obj.device.type != device.type
-                    or device.index != obj.device.index
-                ):
-                    if dtype is not None:
-                        self.__dict__[batch_key] = obj.type(dtype).to(device)
-                    else:
-                        self.__dict__[batch_key] = obj.to(device)
-            elif isinstance(obj, Batch):
-                obj.to_torch(dtype, device)
-            else:
-                # ndarray or scalar
-                if not isinstance(obj, np.ndarray):
-                    obj = np.asanyarray(obj)  # noqa: PLW2901
-                obj = torch.from_numpy(obj).to(device)  # noqa: PLW2901
+        def arr_to_torch(arr: TArr) -> TArr:
+            if isinstance(arr, np.ndarray):
+                return torch.from_numpy(arr).to(device)
+
+            # TODO: simplify
+            if (
+                dtype is not None
+                and arr.dtype != dtype
+                or arr.device.type != device.type
+                or device.index != arr.device.index
+            ):
                 if dtype is not None:
-                    obj = obj.type(dtype)  # noqa: PLW2901
-                self.__dict__[batch_key] = obj
+                    arr = arr.type(dtype)
+                return arr.to(device)
+            return arr
+
+        self.apply_values_transform(arr_to_torch, inplace=True)
 
     def __cat(self, batches: Sequence[dict | Self], lens: list[int]) -> None:
         """Private method for Batch.cat_.
@@ -637,7 +899,7 @@ class Batch(BatchProtocol):
             {
                 batch_key
                 for batch_key, obj in batch.items()
-                if not (isinstance(obj, Batch) and obj.is_empty())
+                if not (isinstance(obj, Batch) and len(obj.get_keys()) == 0)
             }
             for batch in batches
         ]
@@ -668,7 +930,7 @@ class Batch(BatchProtocol):
                 if key not in batch.__dict__:
                     continue
                 value = batch.get(key)
-                if isinstance(value, Batch) and value.is_empty():
+                if isinstance(value, Batch) and len(value.get_keys()) == 0:
                     continue
                 try:
                     self.__dict__[key][sum_lens[i] : sum_lens[i + 1]] = value
@@ -681,33 +943,58 @@ class Batch(BatchProtocol):
             batches = [batches]
         # check input format
         batch_list = []
+
+        original_keys_only_batch = None
+        """A batch with all values removed, just keys left. Can be considered a sort of schema.
+        Will be either the schema of self, or of the first non-empty batch in the sequence.
+        """
+        if len(self) > 0:
+            original_keys_only_batch = self.apply_values_transform(lambda x: None)
+            original_keys_only_batch.replace_empty_batches_by_none()
+
         for batch in batches:
             if isinstance(batch, dict):
-                if len(batch) > 0:
-                    batch_list.append(Batch(batch))
-            elif isinstance(batch, Batch):
-                # x.is_empty() means that x is Batch() and should be ignored
-                if not batch.is_empty():
-                    batch_list.append(batch)
-            else:
+                batch = Batch(batch)
+            if not isinstance(batch, Batch):
                 raise ValueError(f"Cannot concatenate {type(batch)} in Batch.cat_")
+            if len(batch.get_keys()) == 0:
+                continue
+            if original_keys_only_batch is None:
+                original_keys_only_batch = batch.apply_values_transform(lambda x: None)
+                original_keys_only_batch.replace_empty_batches_by_none()
+                batch_list.append(batch)
+                continue
+
+            cur_keys_only_batch = batch.apply_values_transform(lambda x: None)
+            cur_keys_only_batch.replace_empty_batches_by_none()
+            if original_keys_only_batch != cur_keys_only_batch:
+                raise ValueError(
+                    f"Batch.cat_ only supports concatenation of batches with the same structure but got "
+                    f"structures: \n{original_keys_only_batch}\n   and\n{cur_keys_only_batch}.",
+                )
+            batch_list.append(batch)
         if len(batch_list) == 0:
             return
+
         batches = batch_list
+
+        # TODO: lot's of the remaining logic is devoted to filling up remaining keys with zeros
+        #   this should be removed, and also the check above should be extended to nested keys
         try:
-            # x.is_empty(recurse=True) here means x is a nested empty batch
+            # len(batch) here means batch is a nested empty batch
             # like Batch(a=Batch), and we have to treat it as length zero and
             # keep it.
-            lens = [0 if batch.is_empty(recurse=True) else len(batch) for batch in batches]
+            lens = [0 if len(batch) == 0 else len(batch) for batch in batches]
         except TypeError as exception:
             raise ValueError(
                 "Batch.cat_ meets an exception. Maybe because there is any "
                 f"scalar in {batches} but Batch.cat_ does not support the "
                 "concatenation of scalar.",
             ) from exception
-        if not self.is_empty():
+        if len(self.get_keys()) != 0:
             batches = [self, *list(batches)]
-            lens = [0 if self.is_empty(recurse=True) else len(self), *lens]
+            # len of zero means that that item is Batch() and should be ignored
+            lens = [0 if len(self) == 0 else len(self), *lens]
         self.__cat(batches, lens)
 
     @staticmethod
@@ -724,22 +1011,21 @@ class Batch(BatchProtocol):
                 if len(batch) > 0:
                     batch_list.append(Batch(batch))
             elif isinstance(batch, Batch):
-                # x.is_empty() means that x is Batch() and should be ignored
-                if not batch.is_empty():
+                if len(batch.get_keys()) != 0:
                     batch_list.append(batch)
             else:
                 raise ValueError(f"Cannot concatenate {type(batch)} in Batch.stack_")
         if len(batch_list) == 0:
             return
         batches = batch_list
-        if not self.is_empty():
+        if len(self.get_keys()) != 0:
             batches = [self, *batches]
         # collect non-empty keys
         keys_map = [
             {
                 batch_key
                 for batch_key, obj in batch.items()
-                if not (isinstance(obj, BatchProtocol) and obj.is_empty())
+                if not (isinstance(obj, BatchProtocol) and len(obj.get_keys()) == 0)
             }
             for batch in batches
         ]
@@ -785,7 +1071,7 @@ class Batch(BatchProtocol):
                 # TODO: fix code/annotations s.t. the ignores can be removed
                 if (
                     isinstance(value, BatchProtocol)  # type: ignore
-                    and value.is_empty()  # type: ignore
+                    and len(value.get_keys()) == 0  # type: ignore
                 ):
                     continue  # type: ignore
                 try:
@@ -839,60 +1125,31 @@ class Batch(BatchProtocol):
             self.update(kwargs)
 
     def __len__(self) -> int:
-        """Return len(self)."""
+        """Raises `TypeError` if any value in the batch has no len(), typically meaning it's a batch of scalars."""
         lens = []
-        for obj in self.__dict__.values():
-            if isinstance(obj, Batch) and obj.is_empty(recurse=True):
+        for key, obj in self.__dict__.items():
+            # TODO: causes inconsistent behavior to batch with empty batches
+            #  and batch with empty sequences of other type. Remove, but only after
+            #  Buffer and Collectors have been improved to no longer rely on this
+            if isinstance(obj, Batch) and len(obj) == 0:
+                continue
+            if obj is None:
                 continue
             if hasattr(obj, "__len__") and (isinstance(obj, Batch) or obj.ndim > 0):
                 lens.append(len(obj))
-            else:
-                raise TypeError(f"Object {obj} in {self} has no len()")
-        if len(lens) == 0:
-            # empty batch has the shape of any, like the tensorflow '?' shape.
-            # So it has no length.
-            raise TypeError(f"Object {self} has no len()")
+                continue
+            if isinstance(obj, Distribution):
+                lens.append(get_len_of_dist(obj))
+                continue
+            raise TypeError(f"Entry for {key} in {self} is {obj} has no len()")
+        if not lens:
+            return 0
         return min(lens)
-
-    def is_empty(self, recurse: bool = False) -> bool:
-        """Test if a Batch is empty.
-
-        If ``recurse=True``, it further tests the values of the object; else
-        it only tests the existence of any key.
-
-        ``b.is_empty(recurse=True)`` is mainly used to distinguish
-        ``Batch(a=Batch(a=Batch()))`` and ``Batch(a=1)``. They both raise
-        exceptions when applied to ``len()``, but the former can be used in
-        ``cat``, while the latter is a scalar and cannot be used in ``cat``.
-
-        Another usage is in ``__len__``, where we have to skip checking the
-        length of recursively empty Batch.
-        ::
-
-            >>> Batch().is_empty()
-            True
-            >>> Batch(a=Batch(), b=Batch(c=Batch())).is_empty()
-            False
-            >>> Batch(a=Batch(), b=Batch(c=Batch())).is_empty(recurse=True)
-            True
-            >>> Batch(d=1).is_empty()
-            False
-            >>> Batch(a=np.float64(1.0)).is_empty()
-            False
-        """
-        if len(self.__dict__) == 0:
-            return True
-        if not recurse:
-            return False
-        return all(
-            False if not isinstance(obj, Batch) else obj.is_empty(recurse=True)
-            for obj in self.values()
-        )
 
     @property
     def shape(self) -> list[int]:
         """Return self.shape."""
-        if self.is_empty():
+        if len(self.get_keys()) == 0:
             return []
         data_shape = []
         for obj in self.__dict__.values():
@@ -921,3 +1178,163 @@ class Batch(BatchProtocol):
                 yield self[indices[idx:]]
                 break
             yield self[indices[idx : idx + size]]
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable,
+    ) -> Self:
+        ...
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable,
+        inplace: Literal[True],
+    ) -> None:
+        ...
+
+    @overload
+    def apply_values_transform(
+        self,
+        values_transform: Callable,
+        inplace: Literal[False],
+    ) -> Self:
+        ...
+
+    def apply_values_transform(
+        self,
+        values_transform: Callable,
+        inplace: bool = False,
+    ) -> None | Self:
+        """Applies a function to all non-batch-values in the batch, including
+        values in nested batches.
+
+        A batch with keys pointing to either batches or to non-batch values can
+        be thought of as a tree of Batch nodes. This function traverses the tree
+        and applies the function to all leaf nodes (i.e. values that are not
+        batches themselves).
+
+        The values are usually arrays, but can also be scalar values of an
+        arbitrary type since retrieving a single entry from a Batch a la
+        `batch[0]` will return a batch with scalar values.
+        """
+        return _apply_batch_values_func_recursively(self, values_transform, inplace=inplace)
+
+    def set_array_at_key(
+        self,
+        arr: np.ndarray,
+        key: str,
+        index: IndexType | None = None,
+        default_value: float | None = None,
+    ) -> None:
+        if index is not None:
+            if key not in self.get_keys():
+                log.info(
+                    f"Key {key} not found in batch, "
+                    f"creating a sequence of len {len(self)} with {default_value=} for it.",
+                )
+                try:
+                    self[key] = np.array([default_value] * len(self), dtype=arr.dtype)
+                except TypeError as exception:
+                    raise TypeError(
+                        f"Cannot create a sequence of dtype {arr.dtype} with default value {default_value}. "
+                        f"You can fix this either by passing an array with the correct dtype or by passing "
+                        f"a different default value that can be cast to the array's dtype (or both).",
+                    ) from exception
+            else:
+                existing_entry = self[key]
+                if isinstance(existing_entry, BatchProtocol):
+                    raise ValueError(
+                        f"Cannot set sequence at key {key} because it is a nested batch, "
+                        f"can only set a subsequence of an array.",
+                    )
+            self[key][index] = arr
+        else:
+            if len(arr) != len(self):
+                raise ValueError(
+                    f"Sequence length {len(arr)} does not match "
+                    f"batch length {len(self)}. For setting a subsequence with missing "
+                    f"entries filled up by default values, consider passing an index.",
+                )
+            self[key] = arr
+
+    def isnull(self) -> Self:
+        return self.apply_values_transform(pd.isnull, inplace=False)
+
+    def hasnull(self) -> bool:
+        isnan_batch = self.isnull()
+        is_any_null_batch = isnan_batch.apply_values_transform(np.any, inplace=False)
+
+        def is_any_true(boolean_batch: BatchProtocol) -> bool:
+            for val in boolean_batch.values():
+                if isinstance(val, BatchProtocol):
+                    if is_any_true(val):
+                        return True
+                else:
+                    assert val.size == 1, "This shouldn't have happened, it's a bug!"
+                    # an unsized array with a boolean, e.g. np.array(False). behaves like the boolean itself
+                    if val:
+                        return True
+            return False
+
+        return is_any_true(is_any_null_batch)
+
+    def dropnull(self) -> Self:
+        # we need to use dicts since a batch retrieved for a single index has no length and cat fails
+        # TODO: make cat work with batches containing scalars?
+        sub_batches = []
+        for b in self:
+            if b.hasnull():
+                continue
+            # needed for cat to work
+            b = b.apply_values_transform(np.atleast_1d)
+            sub_batches.append(b)
+        return Batch.cat(sub_batches)
+
+    def replace_empty_batches_by_none(self) -> None:
+        """Goes through the batch-tree" recursively and replaces empty batches by None.
+
+        This is useful for extracting the structure of a batch without the actual data,
+        especially in combination with `apply_values_transform` with a
+        transform function a la `lambda x: None`.
+        """
+        empty_batch = Batch()
+        for key, val in self.items():
+            if isinstance(val, Batch):
+                if val == empty_batch:
+                    self[key] = None
+                else:
+                    val.replace_empty_batches_by_none()
+
+    def to_at_least_2d(self) -> Self:
+        """Ensures that all arrays and dists in the batch have at least 2 dimensions.
+
+        This is useful for ensuring that all arrays in the batch can be concatenated
+        along a new axis.
+        """
+        result = self.apply_values_transform(np.atleast_2d, inplace=False)
+        for key, val in self.items():
+            if isinstance(val, Distribution):
+                result[key] = dist_to_atleast_2d(val)
+        return result
+
+
+def _apply_batch_values_func_recursively(
+    batch: TBatch,
+    values_transform: Callable,
+    inplace: bool = False,
+) -> TBatch | None:
+    """Applies the desired function on all values of the batch recursively.
+
+    See docstring of the corresponding method in the Batch class for more details.
+    """
+    result = batch if inplace else deepcopy(batch)
+    for key, val in batch.__dict__.items():
+        if isinstance(val, BatchProtocol):
+            result[key] = _apply_batch_values_func_recursively(val, values_transform, inplace=False)
+        else:
+            result[key] = values_transform(val)
+    if not inplace:
+        return result
+    return None

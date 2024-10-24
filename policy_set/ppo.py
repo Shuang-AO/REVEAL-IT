@@ -6,13 +6,16 @@ import numpy as np
 import torch
 from torch import nn
 
-from tianshou.data import ReplayBuffer, SequenceSummaryStats, to_torch_as
-from tianshou.data.types import LogpOldProtocol, RolloutBatchProtocol
-from tianshou.policy import A2CPolicy
-from tianshou.policy.base import TLearningRateScheduler, TrainingStats
-from tianshou.policy.modelfree.pg import TDistributionFunction
-from tianshou.utils.net.common import ActorCritic
+from data import ReplayBuffer, SequenceSummaryStats, to_torch_as
+from data.types import LogpOldProtocol, RolloutBatchProtocol
+from policy_set import A2CPolicy
+from policy_set.base import TLearningRateScheduler, TrainingStats
+from policy_set.pg import TDistributionFunction
+#from utils.net.common import ActorCritic
 
+def get_actor_critic():
+    from utils.net.common import ActorCritic
+    return ActorCritic  #
 
 @dataclass(kw_only=True)
 class PPOTrainingStats(TrainingStats):

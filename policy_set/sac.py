@@ -13,7 +13,7 @@ from data.types import (
     ObsBatchProtocol,
     RolloutBatchProtocol,
 )
-from tianshou.exploration import BaseNoise
+from utils.exploration import BaseNoise
 from policy_set import DDPGPolicy
 from policy_set.base import TLearningRateScheduler, TrainingStats
 from utils.conversion import to_optional_float

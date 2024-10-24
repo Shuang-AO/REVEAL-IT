@@ -29,7 +29,7 @@ from utils import (
     deprecation,
     tqdm_config,
 )
-from tianshou.utils.logging import set_numerical_fields_to_precision
+from utils.logging import set_numerical_fields_to_precision
 
 log = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ from overrides import override
 from torch import nn
 
 from data import ReplayBuffer, SequenceSummaryStats, to_numpy, to_torch_as
-from data.batch import Batch, BatchProtocol, arr_type
+from data.batch import Batch, BatchProtocol, TArr
 from data.buffer.base import TBuffer
 from data.types import (
     ActBatchProtocol,
@@ -122,7 +122,6 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         self,
         *,
         action_space: gym.Space,
-        # TODO: does the policy actually need the observation space?
         observation_space: gym.Space | None = None,
         action_scaling: bool = False,
         action_bound_method: Literal["clip", "tanh"] | None = "clip",
@@ -163,10 +162,6 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         """Set self.agent_id = agent_id, for MARL."""
         self.agent_id = agent_id
 
-    # TODO: needed, since for most of offline algorithm, the algorithm itself doesn't
-    #  have a method to add noise to action.
-    #  So we add the default behavior here. It's a little messy, maybe one can
-    #  find a better way to do this.
     def exploration_noise(
         self,
         act: np.ndarray | BatchProtocol,
@@ -181,7 +176,7 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def compute_action(
         self,
-        obs: arr_type,
+        obs: TArr,
         info: dict[str, Any] | None = None,
         state: dict | BatchProtocol | np.ndarray | None = None,
     ) -> np.ndarray | int:
@@ -204,10 +199,11 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         batch: ObsBatchProtocol,
         state: dict | BatchProtocol | np.ndarray | None = None,
         **kwargs: Any,
-    ) -> ActBatchProtocol:
+    ) -> ActBatchProtocol:"""Compute action over the given batch data.
+    """
    
     @staticmethod
-    def _action_to_numpy(act: arr_type) -> np.ndarray:
+    def _action_to_numpy(act: TArr) -> np.ndarray:
         act = to_numpy(act)  # NOTE: to_numpy could confusingly also return a Batch
         if not isinstance(act, np.ndarray):
             raise ValueError(
@@ -217,7 +213,7 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def map_action(
         self,
-        act: arr_type,
+        act: TArr,
     ) -> np.ndarray:
       
         act = self._action_to_numpy(act)
@@ -236,7 +232,7 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     def map_action_inverse(
         self,
-        act: arr_type,
+        act: TArr,
     ) -> np.ndarray:
         act = self._action_to_numpy(act)
         if isinstance(self.action_space, gym.spaces.Box):
@@ -264,7 +260,16 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
     @abstractmethod
     def learn(self, batch: RolloutBatchProtocol, *args: Any, **kwargs: Any) -> TTrainingStats:
+        """Update policy with a given batch of data.
 
+        :return: A dataclass object, including the data needed to be logged (e.g., loss).
+            If you use ``torch.distributions.Normal`` and
+            ``torch.distributions.Categorical`` to calculate the log_prob,
+            please be careful about the shape: Categorical distribution gives
+            "[batch_size]" shape while Normal distribution gives "[batch_size,
+            1]" shape. The auto-broadcasting of numerical operation with torch
+            tensors will amplify this error.
+        """
     def post_process_fn(
         self,
         batch: BatchProtocol,

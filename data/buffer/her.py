@@ -3,9 +3,9 @@ from typing import Any, Union, cast
 
 import numpy as np
 
-from tianshou.data import Batch, ReplayBuffer
-from tianshou.data.batch import BatchProtocol
-from tianshou.data.types import RolloutBatchProtocol
+from data import Batch, ReplayBuffer
+from data.batch import BatchProtocol
+from data.types import RolloutBatchProtocol
 
 
 class HERReplayBuffer(ReplayBuffer):

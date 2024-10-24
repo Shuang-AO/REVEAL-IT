@@ -1,7 +1,7 @@
 import numpy as np
 
-from tianshou.data import ReplayBuffer, ReplayBufferManager
-from tianshou.data.types import RolloutBatchProtocol
+from data import ReplayBuffer, ReplayBufferManager
+from data.types import RolloutBatchProtocol
 
 
 class CachedReplayBuffer(ReplayBufferManager):
